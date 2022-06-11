@@ -5,7 +5,7 @@ then you can call the methods on RealityView `myARView.startRecording()` `myARVi
 No additional setup neccessary.
 
 ## SwiftUI Example
-```
+```swift
 // 1. Initialize RealityView for SwiftUI
 struct ARViewContainer: UIViewRepresentable {
     var arView: RealityView!
