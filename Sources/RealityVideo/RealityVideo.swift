@@ -12,21 +12,16 @@ public enum RecordingState: String, CaseIterable {
 
 public class RealityView: ARView {
     public var arView: ARView { return self }
-    public var audioMode: AVAudioSession.Category = .record
-    public var audioOptions: AVAudioSession.CategoryOptions = [.mixWithOthers]
+    public var settings: RealityVideoSettings = RealityVideoSettings.standard
     
     private(set) var captureState: RecordingState = .idle
     
-    private var recordingStartTime = TimeInterval(0)
     private var writer: AVAssetWriter!
     private var input: AVAssetWriterInput!
     private var assetWriterPixelBufferInput: AVAssetWriterInputPixelBufferAdaptor!
-    private var filename: String = ""
     private var assetWriterWidth: Int!
     private var assetWriterHeight: Int!
     private var frameCount = 0
-    private var outputURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, conformingTo: .quickTimeMovie)
     
     private var textureCache: CVMetalTextureCache?
     let metalDevice = MTLCreateSystemDefaultDevice()
@@ -36,7 +31,16 @@ public class RealityView: ARView {
         setupAudioSession()
         enableBuiltInMic()
         setupMetal()
-        self.session.delegate = self
+        session.delegate = self
+    }
+    
+    public init(settings: RealityVideoSettings) {
+        self.settings = settings
+        super.init(frame: .zero)
+        setupAudioSession()
+        enableBuiltInMic()
+        setupMetal()
+        session.delegate = self
     }
     
     @MainActor required dynamic init?(coder decoder: NSCoder) {
@@ -60,25 +64,16 @@ public class RealityView: ARView {
         }
     }
     
-    private func setupMetal() {
-        guard let
-                metalDevice = metalDevice, CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, metalDevice, nil, &textureCache) == kCVReturnSuccess
-        else {
-            print("setup metal failed")
-            return
-        }
-    }
-    
     private func setupAssetWriter(width: Int, height: Int) {
-        writer = try! AVAssetWriter(outputURL: outputURL, fileType: .mov)
+        writer = try! AVAssetWriter(outputURL: settings.outputURL, fileType: .mov)
         print(writer.status.rawValue)
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: assetWriterWidth as! Int,
-            AVVideoHeightKey: assetWriterHeight as! Int,
+            AVVideoWidthKey: assetWriterWidth!,
+            AVVideoHeightKey: assetWriterHeight!,
             AVVideoCompressionPropertiesKey: [
                 //                "AllowFrameReordering": 1,
-                "AverageBitRate": 1000000,
+                "AverageBitRate": settings.bitrate,
                 "ExpectedFrameRate": 60,
                 //                "Priority": 80,
                 "ProfileLevel": AVVideoProfileLevelH264MainAutoLevel,
@@ -106,7 +101,7 @@ public class RealityView: ARView {
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(audioMode, options: audioOptions)
+            try session.setCategory(settings.audioMode, options: settings.audioOptions)
             try session.setActive(true)
         } catch {
             fatalError("Failed to configure and activate session.")
@@ -145,17 +140,13 @@ extension RealityView: ARSessionDelegate {
             print(writer.status.rawValue)
         }
         switch captureState {
-        case .start:
-            break
-        case .idle:
+        case .start, .idle, .end:
             break
         case .capturing:
             guard let texture = transformFrames(pixelBuffer: pixelBuffer, width: assetWriterWidth, height: assetWriterHeight) else {
                 return
             }
             writeFrame(forTexture: texture)
-        case .end:
-            break
         }
     }
     
@@ -163,6 +154,16 @@ extension RealityView: ARSessionDelegate {
 
 // MARK: Metal Stuff
 extension RealityView {
+    
+    private func setupMetal() {
+        guard let
+                metalDevice = metalDevice, CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, metalDevice, nil, &textureCache) == kCVReturnSuccess
+        else {
+            print("setup metal failed")
+            return
+        }
+    }
+    
     private func transformFrames(pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> MTLTexture? {
         let format: MTLPixelFormat = .bgra8Unorm
         var textureRef: CVMetalTexture?
@@ -206,7 +207,6 @@ extension RealityView {
         
         texture.getBytes(pixelBufferBytes, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)
         
-        let frameTime = CACurrentMediaTime() - recordingStartTime
         let presentationTime = CMTime(seconds: Double(frameCount), preferredTimescale: 60)
         
         assetWriterPixelBufferInput.append(pixelBuffer, withPresentationTime: presentationTime)
