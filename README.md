@@ -40,9 +40,11 @@ struct ContentView: View {
                 // 4. start recording
                 switch arView.arView.captureState {
                 case .idle:
-                    arView.arView.startRecording(outputURL: FileManager.default.temporaryDirectory)
+                    arView.arView.startRecording()
                 case .capturing:
-                    arView.arView.endRecording()
+                    arView.arView.endRecording { 
+                        // optionally perform some work when recording finishes
+                    }
                 default:
                     break
                 }
