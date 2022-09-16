@@ -12,7 +12,7 @@ public enum RecordingState: String, CaseIterable {
 
 public class RealityView: ARView {
     public var arView: ARView { return self }
-    public var settings: RealityVideoSettings = RealityVideoSettings.standard
+    public var settings: VideoSettings = RealityVideoSettings.standard
     
     private(set) var captureState: RecordingState = .idle
     
@@ -34,7 +34,7 @@ public class RealityView: ARView {
         session.delegate = self
     }
     
-    public init(settings: RealityVideoSettings) {
+    public init<Settings: VideoSettings>(settings: Settings) {
         self.settings = settings
         super.init(frame: .zero)
         setupAudioSession()
