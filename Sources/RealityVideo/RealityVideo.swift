@@ -1,217 +1,296 @@
-import RealityKit
-import ARKit
 import AVFoundation
-import Metal
+import RealityKit
+import ReplayKit
+import UIKit
 
-public enum RecordingState: String, CaseIterable {
-    case idle
-    case start
-    case capturing
-    case end
+public enum RealityVideoError: Error, Sendable {
+    case alreadyRecording
+    case notRecording
+    case writerFailed(String)
+    case snapshotFailed
+    case replayKitFailed(Error)
 }
 
-public class RealityView: ARView {
-    public var arView: ARView { return self }
-    public var settings: VideoSettings = RealityVideoSettings.standard
+public enum CaptureMethod: Sendable {
+    case snapshot
+    case replayKit
+}
+
+public struct Settings: Sendable {
+    public var frameRate: Int
+    public var videoBitrate: Int
+    public var codec: AVVideoCodecType
+    public var captureMethod: CaptureMethod
     
-    private(set) var captureState: RecordingState = .idle
-    
-    private var writer: AVAssetWriter!
-    private var input: AVAssetWriterInput!
-    private var assetWriterPixelBufferInput: AVAssetWriterInputPixelBufferAdaptor!
-    private var assetWriterWidth: Int!
-    private var assetWriterHeight: Int!
-    private var frameCount = 0
-    
-    private var textureCache: CVMetalTextureCache?
-    let metalDevice = MTLCreateSystemDefaultDevice()
-    
-    public required init(frame frameRect: CGRect) {
-        super.init(frame: frameRect)
-        setupAudioSession()
-        enableBuiltInMic()
-        setupMetal()
-        session.delegate = self
+    public init(
+        frameRate: Int = 30,
+        videoBitrate: Int = 10_000_000,
+        codec: AVVideoCodecType = .hevc,
+        captureMethod: CaptureMethod = .snapshot
+    ) {
+        self.frameRate = frameRate
+        self.videoBitrate = videoBitrate
+        self.codec = codec
+        self.captureMethod = captureMethod
     }
     
-    public init<Settings: VideoSettings>(settings: Settings) {
-        self.settings = settings
-        super.init(frame: .zero)
-        setupAudioSession()
-        enableBuiltInMic()
-        setupMetal()
-        session.delegate = self
+    public static let `default` = Settings()
+}
+
+@MainActor
+public final class RealityVideoRecorder {
+    
+    private weak var arView: ARView?
+    private var videoWriter: AVAssetWriter?
+    private var videoWriterInput: AVAssetWriterInput?
+    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var displayLink: CADisplayLink?
+    private var startTime: CFTimeInterval = 0
+    private var outputURL: URL?
+    private var currentSettings: Settings = .default
+    
+    public private(set) var isRecording: Bool = false
+    
+    public init(arView: ARView) {
+        self.arView = arView
     }
     
-    @MainActor required dynamic init?(coder decoder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    public func startRecording() {
-        captureState = .start
-        setupAssetWriter(width: assetWriterWidth, height: assetWriterHeight)
-        captureState = .capturing
-    }
-    
-    public func endRecording(_ completion: (() -> Void)? = nil) {
-        captureState = .end
-        input.markAsFinished()
-        writer.finishWriting { [weak self] in
-            guard let self = self else { return }
-            self.writer = nil
-            self.input = nil
-            completion?()
+    public func startRecording(to url: URL? = nil, settings: Settings = .default) async throws {
+        guard !isRecording else {
+            throw RealityVideoError.alreadyRecording
+        }
+        
+        guard let arView else {
+            throw RealityVideoError.writerFailed("ARView is no longer available")
+        }
+        
+        currentSettings = settings
+        
+        let fileURL = url ?? FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("mp4")
+        outputURL = fileURL
+        
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            try FileManager.default.removeItem(at: fileURL)
+        }
+        
+        let width = Int(arView.bounds.width * arView.contentScaleFactor)
+        let height = Int(arView.bounds.height * arView.contentScaleFactor)
+        
+        try setupWriter(url: fileURL, width: width, height: height, settings: settings)
+        
+        isRecording = true
+        
+        switch settings.captureMethod {
+        case .snapshot:
+            startSnapshotCapture()
+        case .replayKit:
+            try await startReplayKitCapture()
         }
     }
     
-    private func setupAssetWriter(width: Int, height: Int) {
-        writer = try! AVAssetWriter(outputURL: settings.outputURL, fileType: .mov)
-        print(writer.status.rawValue)
-        let settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: assetWriterWidth!,
-            AVVideoHeightKey: assetWriterHeight!,
+    public func stopRecording() async throws -> URL {
+        guard isRecording else {
+            throw RealityVideoError.notRecording
+        }
+        
+        switch currentSettings.captureMethod {
+        case .snapshot:
+            stopSnapshotCapture()
+        case .replayKit:
+            await stopReplayKitCapture()
+        }
+        
+        guard let videoWriterInput, let videoWriter, let outputURL else {
+            throw RealityVideoError.writerFailed("Writer not configured")
+        }
+        
+        videoWriterInput.markAsFinished()
+        
+        await withCheckedContinuation { continuation in
+            videoWriter.finishWriting {
+                continuation.resume()
+            }
+        }
+        
+        isRecording = false
+        
+        if videoWriter.status == .failed {
+            throw RealityVideoError.writerFailed(videoWriter.error?.localizedDescription ?? "Unknown error")
+        }
+        
+        self.videoWriter = nil
+        self.videoWriterInput = nil
+        self.pixelBufferAdaptor = nil
+        
+        return outputURL
+    }
+    
+    private func setupWriter(url: URL, width: Int, height: Int, settings: Settings) throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: settings.codec,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
             AVVideoCompressionPropertiesKey: [
-                //                "AllowFrameReordering": 1,
-                "AverageBitRate": settings.bitrate,
-                "ExpectedFrameRate": 60,
-                //                "Priority": 80,
-                "ProfileLevel": AVVideoProfileLevelH264MainAutoLevel,
-                //                "RealTime": 1
+                AVVideoAverageBitRateKey: settings.videoBitrate,
+                AVVideoExpectedSourceFrameRateKey: settings.frameRate
             ]
         ]
-        let sourcePixelBufferAttributes: [String: Any] = [
+        
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        input.expectsMediaDataInRealTime = true
+        
+        let pixelBufferAttributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height]
-        input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        //        input.mediaTimeScale = CMTimeScale(bitPattern: 600)
-        input.expectsMediaDataInRealTime = true
-        //        input.transform = CGAffineTransform(rotationAngle: .pi/2)
-        assetWriterPixelBufferInput = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: sourcePixelBufferAttributes)
+            kCVPixelBufferHeightKey as String: height
+        ]
+        
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: pixelBufferAttributes
+        )
+        
         writer.add(input)
+        
+        videoWriter = writer
+        videoWriterInput = input
+        pixelBufferAdaptor = adaptor
+        
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
-        print(writer.status.rawValue)
-        if assetWriterPixelBufferInput.pixelBufferPool == nil {
-            print("pool is nil")
-        }
     }
     
-    private func setupAudioSession() {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(settings.audioMode, options: settings.audioOptions)
-            try session.setActive(true)
-        } catch {
-            fatalError("Failed to configure and activate session.")
-        }
+    // MARK: - Snapshot Capture
+    
+    private func startSnapshotCapture() {
+        let displayLink = CADisplayLink(target: self, selector: #selector(captureFrame))
+        displayLink.preferredFrameRateRange = CAFrameRateRange(
+            minimum: Float(currentSettings.frameRate),
+            maximum: Float(currentSettings.frameRate),
+            preferred: Float(currentSettings.frameRate)
+        )
+        startTime = CACurrentMediaTime()
+        displayLink.add(to: .main, forMode: .common)
+        self.displayLink = displayLink
     }
     
-    private func enableBuiltInMic() {
-        // Get the shared audio session.
-        let session = AVAudioSession.sharedInstance()
-        
-        // Find the built-in microphone input.
-        guard let availableInputs = session.availableInputs else {
-            print("The device must have a built-in microphone.")
+    private func stopSnapshotCapture() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+    
+    @objc private func captureFrame(_ displayLink: CADisplayLink) {
+        guard isRecording,
+              let arView,
+              let videoWriterInput,
+              videoWriterInput.isReadyForMoreMediaData else {
             return
         }
-        if let builtInMicInput = availableInputs.first(where: { $0.portType == .builtInMic }) {
-            // Make the built-in microphone input the preferred input.
-            do {
-                try session.setPreferredInput(builtInMicInput)
-            } catch {
-                // use the first available input
-                try? session.setPreferredInput(availableInputs.first!)
+        
+        let presentationTime = CMTime(seconds: displayLink.timestamp - startTime, preferredTimescale: 600)
+        
+        arView.snapshot(saveToHDR: false) { [weak self] image in
+            guard let self, let image else { return }
+            
+            Task { @MainActor in
+                self.appendImage(image, at: presentationTime)
             }
         }
     }
     
-}
-
-extension RealityView: ARSessionDelegate {
-    public func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        frameCount += 1
-        let pixelBuffer = frame.capturedImage
-        assetWriterWidth = CVPixelBufferGetWidth(pixelBuffer)
-        assetWriterHeight = CVPixelBufferGetHeight(pixelBuffer)
-        if writer != nil {
-            print(writer.status.rawValue)
+    private func appendImage(_ image: UIImage, at time: CMTime) {
+        guard let pixelBufferAdaptor,
+              let pixelBufferPool = pixelBufferAdaptor.pixelBufferPool,
+              videoWriterInput?.isReadyForMoreMediaData == true else {
+            return
         }
-        switch captureState {
-        case .start, .idle, .end:
-            break
-        case .capturing:
-            guard let texture = transformFrames(pixelBuffer: pixelBuffer, width: assetWriterWidth, height: assetWriterHeight) else {
-                return
+        
+        var pixelBuffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pixelBufferPool, &pixelBuffer)
+        
+        guard let buffer = pixelBuffer else { return }
+        
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        
+        guard let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer),
+            width: CVPixelBufferGetWidth(buffer),
+            height: CVPixelBufferGetHeight(buffer),
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return }
+        
+        guard let cgImage = image.cgImage else { return }
+        
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        
+        pixelBufferAdaptor.append(buffer, withPresentationTime: time)
+    }
+    
+    // MARK: - ReplayKit Capture
+    
+    private func startReplayKitCapture() async throws {
+        let recorder = RPScreenRecorder.shared()
+        
+        guard recorder.isAvailable else {
+            throw RealityVideoError.writerFailed("Screen recording is not available")
+        }
+        
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            recorder.startCapture { [weak self] sampleBuffer, sampleBufferType, error in
+                guard let self else { return }
+                
+                if let error {
+                    if self.isRecording {
+                        Task { @MainActor in
+                            self.isRecording = false
+                        }
+                    }
+                    return
+                }
+                
+                guard sampleBufferType == .video else { return }
+                
+                Task { @MainActor in
+                    self.appendSampleBuffer(sampleBuffer)
+                }
+            } completionHandler: { error in
+                if let error {
+                    continuation.resume(throwing: RealityVideoError.replayKitFailed(error))
+                } else {
+                    continuation.resume()
+                }
             }
-            writeFrame(forTexture: texture)
         }
     }
     
-}
-
-// MARK: Metal Stuff
-extension RealityView {
-    
-    private func setupMetal() {
-        guard let
-                metalDevice = metalDevice, CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, metalDevice, nil, &textureCache) == kCVReturnSuccess
-        else {
-            print("setup metal failed")
-            return
+    private func stopReplayKitCapture() async {
+        let recorder = RPScreenRecorder.shared()
+        
+        await withCheckedContinuation { continuation in
+            recorder.stopCapture { _ in
+                continuation.resume()
+            }
         }
     }
     
-    private func transformFrames(pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> MTLTexture? {
-        let format: MTLPixelFormat = .bgra8Unorm
-        var textureRef: CVMetalTexture?
-        let result = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache!, pixelBuffer, nil, format, width, height, 0, &textureRef)
-        guard
-            let unwrappedImageTexture = textureRef,
-            let texture = CVMetalTextureGetTexture(unwrappedImageTexture),
-            result == kCVReturnSuccess
-        else {
-            return nil
-        }
-        return texture
-    }
-    
-    private func writeFrame(forTexture texture: MTLTexture) {
-        
-        while !input.isReadyForMoreMediaData {}
-        
-        guard let pixelBufferPool = assetWriterPixelBufferInput.pixelBufferPool else {
-            print("Pixel buffer asset writer input did not have a pixel buffer pool available; cannot retrieve frame")
+    private func appendSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        guard let videoWriterInput,
+              videoWriterInput.isReadyForMoreMediaData,
+              let videoWriter,
+              videoWriter.status == .writing else {
             return
         }
         
-        var maybePixelBuffer: CVPixelBuffer? = nil
-        let status  = CVPixelBufferPoolCreatePixelBuffer(nil, pixelBufferPool, &maybePixelBuffer)
-        if status != kCVReturnSuccess {
-            print("Could not get pixel buffer from asset writer input; dropping frame...")
-            return
-        }
-        
-        guard let pixelBuffer = maybePixelBuffer else {
-            print("pixelBuffer is nil")
-            return
-        }
-        
-        CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        let pixelBufferBytes = CVPixelBufferGetBaseAddress(pixelBuffer)!
-        
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let region = MTLRegionMake2D(0, 0, texture.width, texture.height)
-        
-        texture.getBytes(pixelBufferBytes, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)
-        
-        let presentationTime = CMTime(seconds: Double(frameCount), preferredTimescale: 60)
-        
-        assetWriterPixelBufferInput.append(pixelBuffer, withPresentationTime: presentationTime)
-        
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-        print("frame complete")
+        videoWriterInput.append(sampleBuffer)
     }
 }
